@@ -1,8 +1,13 @@
 import streamlit as st
 import pandas as pd
-import math
 import json
+import math
 import os
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+import io
 
 # ==========================================
 # KONFIGURACJA POD STREAMLIT CLOUD
@@ -12,50 +17,85 @@ os.makedirs("outputs", exist_ok=True)
 
 TEXTS_FILE = "zloty-standard-badanie2.txt"
 CATEGORIES_FILE = "categories.json"
-OUTPUT_FILE = "outputs/anotacje.csv"
+LOCAL_OUTPUT = "outputs/anotacje.csv"   # lokalna kopia pliku
+REMOTE_FILENAME = "anotacje.csv"        # nazwa pliku na Drive
 
 st.set_page_config(page_title="Anotator korpusu", layout="wide")
 
 
 # ==========================================
-# SIDEBAR – USTAWIENIA WYGLĄDU
+# GOOGLE DRIVE – AUTORYZACJA
 # ==========================================
 
-with st.sidebar:
-    st.header("⚙️ Ustawienia wyglądu")
-
-    font_size = st.select_slider(
-        "Rozmiar czcionki",
-        options=["12px", "14px", "16px", "18px", "20px", "22px", "24px"],
-        value="16px"
+@st.cache_resource
+def get_drive_service():
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/drive.file"]
     )
+    return build("drive", "v3", credentials=creds)
 
-    font_family = st.selectbox(
-        "Krój czcionki",
-        [
-            "Arial", "Georgia", "Times New Roman", "Verdana", "Tahoma",
-            "Trebuchet MS", "Courier New", "Roboto", "Open Sans", "Lato"
-        ],
-        index=0
-    )
 
-custom_style = f"""
-<style>
-    html, body, [class*="css"] {{
-        font-size: {font_size} !important;
-        font-family: '{font_family}', sans-serif !important;
-    }}
-    .stAlert {{
-        font-size: {font_size} !important;
-        font-family: '{font_family}', sans-serif !important;
-    }}
-</style>
-"""
-st.markdown(custom_style, unsafe_allow_html=True)
+service = get_drive_service()
+FOLDER_ID = st.secrets["gdrive"]["folder_id"]
 
 
 # ==========================================
-# WCZYTYWANIE DANYCH
+# GOOGLE DRIVE – LOGIKA PLIKU
+# ==========================================
+
+def find_or_create_remote_file():
+    """Znajduje plik anotacji w folderze lub tworzy nowy pusty."""
+    query = f"'{FOLDER_ID}' in parents and name = '{REMOTE_FILENAME}' and trashed = false"
+    results = service.files().list(q=query, spaces="drive", fields="files(id)").execute()
+    files = results.get("files", [])
+
+    if files:
+        return files[0]["id"]
+
+    # nie ma pliku → tworzymy pusty
+    df = pd.DataFrame(columns=["id", "kategorie"])
+    df.to_csv(LOCAL_OUTPUT, sep=";", index=False)
+
+    media = MediaFileUpload(LOCAL_OUTPUT, mimetype="text/csv", resumable=False)
+    file_metadata = {"name": REMOTE_FILENAME, "parents": [FOLDER_ID]}
+
+    created = service.files().create(
+        body=file_metadata, media_body=media, fields="id"
+    ).execute()
+
+    return created["id"]
+
+
+REMOTE_FILE_ID = find_or_create_remote_file()
+
+
+def download_from_drive():
+    """Pobiera plik z Drive i zapisuje lokalnie."""
+    request = service.files().get_media(fileId=REMOTE_FILE_ID)
+    fh = io.BytesIO()
+
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+
+    fh.seek(0)
+    with open(LOCAL_OUTPUT, "wb") as f:
+        f.write(fh.read())
+
+
+def upload_to_drive():
+    """Nadpisuje istniejący plik na Drive."""
+    media = MediaFileUpload(LOCAL_OUTPUT, mimetype="text/csv", resumable=False)
+    service.files().update(
+        fileId=REMOTE_FILE_ID,
+        media_body=media
+    ).execute()
+
+
+# ==========================================
+# WCZYTYWANIE LOKALNYCH PLIKÓW Z DANYMI
 # ==========================================
 
 @st.cache_data
@@ -66,12 +106,10 @@ def load_texts():
             line = line.strip()
             if not line:
                 continue
-
             parts = line.split(maxsplit=1)
             idx = parts[0]
             tekst = parts[1] if len(parts) == 2 else ""
             rows.append({"id": idx, "tekst": tekst})
-
     return pd.DataFrame(rows)
 
 
@@ -81,9 +119,16 @@ def load_categories():
         return json.load(f)
 
 
+# ==========================================
+# WCZYTYWANIE ANOTACJI Z DRIVE
+# ==========================================
+
 def load_annotations():
-    if os.path.exists(OUTPUT_FILE):
-        return pd.read_csv(OUTPUT_FILE, sep=";")
+    # pobranie aktualnej wersji z Google Drive
+    download_from_drive()
+
+    if os.path.exists(LOCAL_OUTPUT):
+        return pd.read_csv(LOCAL_OUTPUT, sep=";")
     return pd.DataFrame(columns=["id", "kategorie"])
 
 
@@ -93,27 +138,31 @@ annotations = load_annotations()
 
 
 # ==========================================
-# FUNKCJE POMOCNICZE
+# FUNKCJE APLIKACJI
 # ==========================================
 
 def save_annotation(idx, selected_categories):
     global annotations
 
     record = {"id": idx, "kategorie": ",".join(selected_categories)}
+
     annotations = annotations[annotations["id"] != idx]
     annotations = pd.concat([annotations, pd.DataFrame([record])], ignore_index=True)
-    annotations.to_csv(OUTPUT_FILE, sep=";", index=False)
+
+    # zapis lokalny
+    annotations.to_csv(LOCAL_OUTPUT, sep=";", index=False)
+
+    # wysyłka na Drive
+    upload_to_drive()
 
 
 def get_categories_for_id(idx):
     rows = annotations[annotations["id"] == idx]
     if len(rows) == 0:
         return []
-
     val = rows.iloc[0]["kategorie"]
     if val is None or (isinstance(val, float) and math.isnan(val)) or val == "":
         return []
-
     return str(val).split(",")
 
 
@@ -134,7 +183,7 @@ if "current_index" not in st.session_state:
 
 
 # ==========================================
-# UI – GŁÓWNY EKRAN
+# UI – INTERFEJS
 # ==========================================
 
 st.title("📑 Anotator tekstów")
